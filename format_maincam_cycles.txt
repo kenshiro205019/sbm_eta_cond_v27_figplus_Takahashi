@@ -1,0 +1,494 @@
+# -*- coding: utf-8 -*-
+"""
+maincamのExcel（Frame, Valueなど）を、turnpointsで指定した1往復を基準に
+サイクル分割→共通軸(Calculated)にリサンプル→Formatted Cycles風のExcelを出力します。
+
+オプション:
+- --repeat : 1往復( start/turn/end )から周期を計算して最後まで繰り返し
+- --period : 周期を固定（例: 21600）
+- --align  : テンプレ波形と相関最大の開始点を探索して、サイクル開始のズレを補正
+- --colorize : 引き出し(Pull)/引き戻し(Return)を色分けしたグラフをChartsシートに自動追加
+
+turnpoints.txt 例:
+  21700
+  32500
+  43300
+  END
+"""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Tuple, Optional
+
+import numpy as np
+import pandas as pd
+
+
+# -----------------------------
+# Helpers: column detection
+# -----------------------------
+def _norm(s: str) -> str:
+    return str(s).strip().lower().replace(" ", "").replace("_", "")
+
+
+def guess_columns(df: pd.DataFrame) -> Tuple[str, str, Optional[str]]:
+    cols = list(df.columns)
+    ncols = [_norm(c) for c in cols]
+
+    frame_col = None
+    value_col = None
+    conf_col = None
+
+    frame_keys = {"frame", "frames", "framenumber", "index", "idx"}
+    value_keys = {"value", "val", "mean", "force", "reading", "digitvalue"}
+    conf_keys = {"confidence", "conf", "score", "prob", "probability"}
+
+    for c, nc in zip(cols, ncols):
+        if nc in frame_keys and frame_col is None:
+            frame_col = c
+        if nc in value_keys and value_col is None:
+            value_col = c
+        if nc in conf_keys and conf_col is None:
+            conf_col = c
+
+    if frame_col is None:
+        for c, nc in zip(cols, ncols):
+            if "frame" in nc or nc.startswith("frm"):
+                frame_col = c
+                break
+
+    if value_col is None:
+        for c, nc in zip(cols, ncols):
+            if "value" in nc or "force" in nc or "mean" in nc or nc.startswith("val"):
+                value_col = c
+                break
+
+    if conf_col is None:
+        for c, nc in zip(cols, ncols):
+            if "conf" in nc or "score" in nc or "prob" in nc:
+                conf_col = c
+                break
+
+    if frame_col is None or value_col is None:
+        raise ValueError(
+            f"Frame列またはValue列を自動判定できませんでした。列名: {list(df.columns)}\n"
+            "Frame列は 'Frame'、Value列は 'Value' のような名前にして再実行してください。"
+        )
+
+    return frame_col, value_col, conf_col
+
+
+# -----------------------------
+# Turnpoints parsing
+# -----------------------------
+def parse_number_token(s: str) -> int:
+    t = s.strip().lower().replace(",", "").replace("_", "")
+    if not t:
+        raise ValueError("空のトークンです。")
+
+    mul = 1
+    if t.endswith("k"):
+        mul = 1000
+        t = t[:-1]
+    elif t.endswith("m"):
+        mul = 1000000
+        t = t[:-1]
+
+    v = float(t) * mul
+    return int(round(v))
+
+
+def read_turnpoints_lines(path: Path) -> List[str]:
+    if not path.exists():
+        raise FileNotFoundError(f"turnpointsファイルが見つかりません: {path}")
+
+    lines: List[str] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if s.startswith("#"):
+            continue
+        lines.append(s)
+
+    if len(lines) < 3:
+        raise ValueError("turnpoints.txt は最低3行必要です（start, turn, end）。")
+    return lines
+
+
+def parse_first_three_points(lines: List[str], last_frame: int) -> Tuple[int, int, int]:
+    special = {"end", "last"}
+    nums: List[int] = []
+    for t in lines:
+        tl = t.strip().lower()
+        if tl in special:
+            nums.append(int(last_frame))
+        else:
+            nums.append(parse_number_token(t))
+        if len(nums) >= 3:
+            break
+    if len(nums) < 3:
+        raise ValueError("start, turn, end の3つの点が必要です。")
+    start0, turn1, end1 = nums[0], nums[1], nums[2]
+    if not (start0 < turn1 < end1):
+        raise ValueError("turnpoints: start < turn < end になっていません。")
+    return start0, turn1, end1
+
+
+# -----------------------------
+# Axis & resample
+# -----------------------------
+def make_calculated_axis(stroke: float = 900.0, step: float = 0.5) -> np.ndarray:
+    if stroke <= 0 or step <= 0:
+        raise ValueError("stroke と step は正の値にしてください。")
+    pull = np.arange(0, stroke + 1e-9, step)          # 0..stroke
+    ret = np.arange(stroke, step - 1e-9, -step)       # stroke..step
+    axis = np.concatenate([pull, ret[1:]])            # stroke重複削除
+    return axis
+
+
+def resample_segment(values: np.ndarray, target_len: int) -> np.ndarray:
+    if target_len <= 0:
+        return np.array([], dtype=np.float32)
+    if len(values) == 0:
+        return np.full((target_len,), np.nan, dtype=np.float32)
+    if len(values) == 1:
+        return np.full((target_len,), float(values[0]), dtype=np.float32)
+
+    x_old = np.linspace(0.0, 1.0, num=len(values))
+    x_new = np.linspace(0.0, 1.0, num=target_len)
+    return np.interp(x_new, x_old, values.astype(np.float32)).astype(np.float32)
+
+
+def fill_nans_1d(v: np.ndarray) -> np.ndarray:
+    v = v.astype(np.float32, copy=True)
+    n = v.size
+    x = np.arange(n, dtype=np.int64)
+    mask = ~np.isnan(v)
+    if mask.all():
+        return v
+    if mask.sum() == 0:
+        return np.zeros_like(v, dtype=np.float32)
+    v[~mask] = np.interp(x[~mask], x[mask], v[mask]).astype(np.float32)
+    return v
+
+
+# -----------------------------
+# Alignment (template matching)
+# -----------------------------
+def zscore(a: np.ndarray) -> np.ndarray:
+    a = a.astype(np.float32, copy=False)
+    m = float(np.mean(a))
+    s = float(np.std(a))
+    if s <= 1e-8:
+        return np.zeros_like(a, dtype=np.float32)
+    return ((a - m) / s).astype(np.float32)
+
+
+def best_match_start(
+    v_full: np.ndarray,
+    template_z: np.ndarray,
+    pred_start: int,
+    search: int,
+    step: int,
+    min_start: int,
+) -> int:
+    L = int(template_z.size)
+    n = int(v_full.size)
+    lo = max(pred_start - search, min_start, 0)
+    hi = min(pred_start + search, n - L - 1)
+    if hi < lo:
+        return max(min(pred_start, n - L - 1), 0)
+
+    best_s = lo
+    best_c = -1e9
+    for s in range(lo, hi + 1, step):
+        seg = v_full[s:s + L]
+        segz = zscore(seg)
+        c = float(np.dot(template_z, segz) / L)
+        if c > best_c:
+            best_c = c
+            best_s = s
+    return best_s
+
+
+# -----------------------------
+# Excel post process: colorize chart
+# -----------------------------
+def add_pull_return_chart(
+    out_path: Path,
+    data_sheet_name: str = "Formatted Cycles",
+    chart_sheet_name: str = "Charts",
+    x_header: str = "Calculated",
+    y_header: str = "Average",
+) -> None:
+    from openpyxl import load_workbook
+    from openpyxl.utils import get_column_letter
+    from openpyxl.chart import ScatterChart, Series, Reference
+
+    wb = load_workbook(out_path)
+    if data_sheet_name not in wb.sheetnames:
+        raise ValueError(f"シート '{data_sheet_name}' が見つかりません。")
+
+    ws = wb[data_sheet_name]
+
+    # ヘッダ（1行目）から列を探す
+    headers = {}
+    for col in range(1, ws.max_column + 1):
+        v = ws.cell(row=1, column=col).value
+        if v is None:
+            continue
+        headers[str(v).strip()] = col
+
+    if x_header not in headers:
+        raise ValueError(f"'{x_header}' 列が見つかりません。")
+    if y_header not in headers:
+        raise ValueError(f"'{y_header}' 列が見つかりません（例: Average / Cycle2 など）。")
+
+    x_col = headers[x_header]
+    y_col = headers[y_header]
+
+    max_row = ws.max_row
+    x_letter = get_column_letter(x_col)
+    y_letter = get_column_letter(y_col)
+
+    # 追加列（末尾に追加）
+    pull_col = ws.max_column + 1
+    ret_col = ws.max_column + 2
+    pull_header = f"{y_header}_Pull"
+    ret_header = f"{y_header}_Return"
+    ws.cell(row=1, column=pull_col, value=pull_header)
+    ws.cell(row=1, column=ret_col, value=ret_header)
+
+    # 数式：Calculatedが増える区間→Pull、減る区間→Return
+    for r in range(2, max_row):
+        ws.cell(row=r, column=pull_col).value = f'=IF({x_letter}{r+1}>={x_letter}{r},{y_letter}{r},NA())'
+        ws.cell(row=r, column=ret_col).value = f'=IF({x_letter}{r+1}<{x_letter}{r},{y_letter}{r},NA())'
+    ws.cell(row=max_row, column=pull_col).value = "=NA()"
+    ws.cell(row=max_row, column=ret_col).value = "=NA()"
+
+    # Chartsシート作成（同名があれば作り直し）
+    if chart_sheet_name in wb.sheetnames:
+        del wb[chart_sheet_name]
+    ws_c = wb.create_sheet(chart_sheet_name)
+
+    # グラフ作成
+    chart = ScatterChart()
+    chart.title = f"{y_header} (Pull/Return)"
+    chart.x_axis.title = x_header
+    chart.y_axis.title = "Value"
+    chart.legend.position = "r"
+
+    xvalues = Reference(ws, min_col=x_col, min_row=2, max_row=max_row)
+
+    pull_values = Reference(ws, min_col=pull_col, min_row=1, max_row=max_row)
+    s_pull = Series(pull_values, xvalues, title_from_data=True)
+
+    ret_values = Reference(ws, min_col=ret_col, min_row=1, max_row=max_row)
+    s_ret = Series(ret_values, xvalues, title_from_data=True)
+
+    # 色（青 / 赤）
+    s_pull.graphicalProperties.line.solidFill = "1F4E79"
+    s_ret.graphicalProperties.line.solidFill = "C00000"
+
+    chart.series.append(s_pull)
+    chart.series.append(s_ret)
+
+    chart.width = 26
+    chart.height = 14
+    ws_c.add_chart(chart, "A1")
+
+    wb.save(out_path)
+
+
+# -----------------------------
+# Main
+# -----------------------------
+@dataclass
+class CycleTP:
+    cycle: int
+    start: int
+    turn: int
+    end: int
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="maincamのExcelを turnpoints 指定で a7のFormatted Cycles風に整形します。")
+    p.add_argument("excel", help="入力Excelファイル（例: maincam010911_v20OK.xlsx）")
+    p.add_argument("--sheet", default=None, help="入力Excelのシート名（省略可）")
+    p.add_argument("--turnpoints", required=True, help="turnpoints.txt のパス")
+    p.add_argument("--stroke", type=float, default=900.0, help="Calculatedの最大値（デフォルト900）")
+    p.add_argument("--step", type=float, default=0.5, help="Calculatedの刻み（デフォルト0.5）")
+    p.add_argument("--min-conf", type=float, default=0.0, help="Confidence列がある場合のみ、これ未満を除外（任意）")
+    p.add_argument("--out", default=None, help="出力Excel名（省略可）")
+
+    p.add_argument("--repeat", action="store_true", help="start/turn/end から周期を決め、最後まで繰り返す")
+    p.add_argument("--period", type=int, default=None, help="1往復のフレーム数を明示（例: 21600）。省略時は end-start")
+    p.add_argument("--max-cycles", type=int, default=2000, help="最大サイクル数（暴走防止）")
+
+    p.add_argument("--align", action="store_true", help="周期ズレを補正して各サイクル開始を合わせる（おすすめ）")
+    p.add_argument("--ref-cycle", type=int, default=2, help="テンプレに使うサイクル番号（例: 2）")
+    p.add_argument("--search", type=int, default=2000, help="開始点探索の±幅（frame）")
+    p.add_argument("--search-step", type=int, default=5, help="探索刻み（frame）")
+    p.add_argument("--template-len", type=int, default=4000, help="テンプレ長（frame）")
+
+    p.add_argument("--colorize", action="store_true", help="出力Excelに引き出し/引き戻しの色分けグラフを追加（Chartsシート）")
+    p.add_argument("--colorize-col", default="Average", help="色分け対象の列名（デフォルトAverage）。例: Cycle2")
+    p.add_argument("--chart-sheet", default="Charts", help="グラフを置くシート名（デフォルトCharts）")
+
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+
+    excel_path = Path(args.excel)
+    if not excel_path.exists():
+        raise FileNotFoundError(f"入力Excelが見つかりません: {excel_path}")
+
+    df = pd.read_excel(excel_path, sheet_name=args.sheet) if args.sheet else pd.read_excel(excel_path)
+    frame_col, value_col, conf_col = guess_columns(df)
+
+    df = df.copy()
+    df[frame_col] = pd.to_numeric(df[frame_col], errors="coerce")
+    df[value_col] = pd.to_numeric(df[value_col], errors="coerce")
+    df = df.dropna(subset=[frame_col])
+    df[frame_col] = df[frame_col].astype(int)
+
+    if conf_col is not None and args.min_conf > 0:
+        df[conf_col] = pd.to_numeric(df[conf_col], errors="coerce")
+        df = df[df[conf_col].fillna(-1) >= float(args.min_conf)]
+
+    df = df.sort_values(frame_col).reset_index(drop=True)
+    last_frame = int(df[frame_col].max())
+
+    # frame→配列化
+    v_full = np.full((last_frame + 1,), np.nan, dtype=np.float32)
+    f = df[frame_col].to_numpy(dtype=np.int64)
+    v = df[value_col].to_numpy(dtype=np.float32)
+    v_full[f] = v
+    v_full = fill_nans_1d(v_full)
+
+    # turnpoints
+    tp_path = Path(args.turnpoints)
+    lines = read_turnpoints_lines(tp_path)
+    start0, turn1, end1 = parse_first_three_points(lines, last_frame=last_frame)
+
+    pull_span = int(turn1 - start0)
+    period = int(args.period) if args.period is not None else int(end1 - start0)
+    if period <= 0 or pull_span <= 0 or pull_span >= period:
+        raise ValueError("turnpoints / period の設定が不正です。")
+
+    # axis
+    stroke = float(args.stroke)
+    step = float(args.step)
+    axis = make_calculated_axis(stroke=stroke, step=step)
+    n_rows = int(axis.size)
+    pull_len = int(round((stroke / step) + 1))
+    ret_len = n_rows - pull_len
+
+    # template
+    if args.align:
+        ref_cycle = int(args.ref_cycle)
+        ref_pred = start0 + (ref_cycle - 1) * period
+        if ref_pred < 0 or ref_pred + int(args.template_len) >= v_full.size:
+            raise ValueError("ref-cycle/template-len がデータ範囲外です。")
+        tmpl = v_full[ref_pred:ref_pred + int(args.template_len)]
+        template_z = zscore(tmpl)
+    else:
+        template_z = None
+
+    # cycles
+    tps: List[CycleTP] = []
+    prev_end = -1
+
+    for k in range(1, int(args.max_cycles) + 1):
+        pred_start = start0 + (k - 1) * period
+        if pred_start >= last_frame:
+            break
+
+        if args.align:
+            start_k = best_match_start(
+                v_full=v_full,
+                template_z=template_z,
+                pred_start=pred_start,
+                search=int(args.search),
+                step=int(args.search_step),
+                min_start=max(prev_end, 0),
+            )
+        else:
+            start_k = max(pred_start, prev_end)
+
+        turn_k = start_k + pull_span
+        end_k = start_k + period
+        if turn_k >= last_frame:
+            break
+        if end_k > last_frame:
+            end_k = last_frame
+        if turn_k >= end_k:
+            break
+
+        tps.append(CycleTP(k, start_k, turn_k, end_k))
+        prev_end = end_k
+
+    n_cycles = len(tps)
+    if n_cycles == 0:
+        raise ValueError("サイクルが作れませんでした。turnpoints/search設定を見直してください。")
+
+    mat = np.full((n_rows, n_cycles), np.nan, dtype=np.float32)
+
+    for i, tp in enumerate(tps):
+        pull_vals = v_full[tp.start:tp.turn + 1]
+        ret_vals = v_full[tp.turn:tp.end + 1]
+        pull_rs = resample_segment(pull_vals, pull_len)
+        ret_rs = resample_segment(ret_vals, ret_len)
+        mat[:, i] = np.concatenate([pull_rs, ret_rs]).astype(np.float32)
+
+        if (i + 1) % 10 == 0 or (i + 1) == n_cycles:
+            print(f"Progress: {i+1}/{n_cycles} cycles")
+
+    out_df = pd.DataFrame({"Calculated": axis})
+    for i in range(n_cycles):
+        out_df[f"Cycle{i+1}"] = mat[:, i]
+
+    out_df["Average"] = np.nanmean(mat, axis=1)
+    out_df["Median"] = np.nanmedian(mat, axis=1)
+    out_df["Max"] = np.nanmax(mat, axis=1)
+    out_df["Min"] = np.nanmin(mat, axis=1)
+
+    tp_df = pd.DataFrame([{
+        "Cycle": tp.cycle,
+        "StartFrame": tp.start,
+        "TurnFrame": tp.turn,
+        "EndFrame": tp.end,
+        "PullSpan": tp.turn - tp.start,
+        "ReturnSpan": tp.end - tp.turn,
+        "Period": tp.end - tp.start,
+    } for tp in tps])
+
+    out_path = Path(args.out) if args.out else excel_path.with_name(excel_path.stem + "_FormattedCycles.xlsx")
+
+    with pd.ExcelWriter(out_path, engine="openpyxl") as w:
+        tp_df.to_excel(w, index=False, sheet_name="TurnPoints")
+        out_df.to_excel(w, index=False, sheet_name="Formatted Cycles")
+
+    # ここが「ifの中身」です（インデント重要）
+    if args.colorize:
+        # 出力ExcelをExcelで開いたままだと保存できません。必ず閉じて実行してください。
+        add_pull_return_chart(
+            out_path=out_path,
+            data_sheet_name="Formatted Cycles",
+            chart_sheet_name=str(args.chart_sheet),
+            x_header="Calculated",
+            y_header=str(args.colorize_col),
+        )
+
+    print(f"OK: saved -> {out_path}")
+    print(f"Info: last_frame={last_frame}, cycles={n_cycles}, rows={n_rows}, period={period}, align={bool(args.align)}, colorize={bool(args.colorize)}")
+
+
+if __name__ == "__main__":
+    main()
