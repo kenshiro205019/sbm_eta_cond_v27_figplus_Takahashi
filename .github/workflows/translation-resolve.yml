@@ -1,0 +1,27 @@
+name: Translation Source Resolver
+on:
+  push:
+    branches: [translation-regeneration-20260809]
+permissions:
+  contents: read
+jobs:
+  resolve:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4 pymupdf
+      - name: Resolve and validate special sources
+        run: python translation_job/resolve_special_sources.py resolved_sources
+      - name: Upload diagnostic sources
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: resolved-special-sources
+          path: resolved_sources
+          retention-days: 1
+          if-no-files-found: warn
