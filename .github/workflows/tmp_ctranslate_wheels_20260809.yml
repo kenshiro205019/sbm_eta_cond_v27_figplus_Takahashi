@@ -1,4 +1,4 @@
-name: Temporary Argos Asian language model download
+name: Temporary NLLB CTranslate2 model download
 
 on:
   pull_request:
@@ -6,50 +6,26 @@ on:
       - main
 
 jobs:
-  fetch-models:
+  fetch-model:
     runs-on: ubuntu-latest
     steps:
-      - name: Download Argos package index and required models
+      - name: Download NLLB-200 distilled 600M INT8 CTranslate2 files
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p models
-          curl -L --fail --retry 5 --retry-delay 3 \
-            'https://raw.githubusercontent.com/argosopentech/argospm-index/main/index.json' \
-            -o models/index.json
-          python3 - <<'PY'
-          import json, pathlib
-          items=json.load(open('models/index.json',encoding='utf-8'))
-          wanted=[]
-          for src in ('ko','zh'):
-              direct=[p for p in items if p.get('from_code')==src and p.get('to_code')=='ja']
-              if direct:
-                  wanted.append(sorted(direct,key=lambda p:p.get('package_version',''))[-1])
-              else:
-                  piv=[p for p in items if p.get('from_code')==src and p.get('to_code')=='en']
-                  if not piv:
-                      raise SystemExit(f'No direct or English-pivot package for {src}')
-                  wanted.append(sorted(piv,key=lambda p:p.get('package_version',''))[-1])
-          with open('models/selected.json','w',encoding='utf-8') as f:
-              json.dump(wanted,f,ensure_ascii=False,indent=2)
-          with open('models/selected.tsv','w',encoding='utf-8') as f:
-              for p in wanted:
-                  links=p.get('links') or []
-                  if not links: raise SystemExit(f'No links for {p}')
-                  name=f"translate-{p['from_code']}_{p['to_code']}-{p.get('package_version','unknown')}.argosmodel"
-                  f.write(name+'\t'+links[0]+'\n')
-          print(json.dumps(wanted,ensure_ascii=False,indent=2))
-          PY
-          while IFS=$'\t' read -r name url; do
-            echo "Downloading $name from $url"
-            curl -L --fail --retry 5 --retry-delay 3 "$url" -o "models/$name"
-            test -s "models/$name"
-          done < models/selected.tsv
-          ls -lh models
-      - name: Upload language models artifact
+          mkdir -p nllb-model
+          base='https://huggingface.co/osa911/nllb-200-distilled-600M-ct2-int8/resolve/main'
+          for f in model.bin sentencepiece.bpe.model shared_vocabulary.json config.json; do
+            echo "Downloading $f"
+            curl -L --fail --retry 8 --retry-delay 5 "$base/$f?download=true" -o "nllb-model/$f"
+            test -s "nllb-model/$f"
+          done
+          sha256sum nllb-model/* > nllb-model/SHA256SUMS.txt
+          ls -lh nllb-model
+      - name: Upload NLLB model artifact
         uses: actions/upload-artifact@v4
         with:
-          name: argos-ko-zh-to-ja-models
-          path: models
+          name: nllb-200-distilled-600M-ct2-int8
+          path: nllb-model
           retention-days: 1
           if-no-files-found: error
