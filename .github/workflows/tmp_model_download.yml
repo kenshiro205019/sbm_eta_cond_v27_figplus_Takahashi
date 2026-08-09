@@ -1,0 +1,29 @@
+name: Temporary English Japanese translation model download
+
+on:
+  push:
+    branches:
+      - tmp-model-download-20260809
+  workflow_dispatch:
+
+jobs:
+  fetch-model:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download and extract CTranslate2 model
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -L --retry 5 --retry-delay 3 \
+            'https://huggingface.co/playto-mt/opus-tatoeba-en-ja-ct2/resolve/main/opus-tatoeba-en-ja-ct2.tar.gz?download=true' \
+            -o opus-tatoeba-en-ja-ct2.tar.gz
+          tar -xzf opus-tatoeba-en-ja-ct2.tar.gz
+          find opus-tatoeba-en-ja-ct2 -maxdepth 2 -type f -printf '%p %s bytes\n'
+
+      - name: Upload extracted model
+        uses: actions/upload-artifact@v4
+        with:
+          name: opus-tatoeba-en-ja-ct2-extracted
+          path: opus-tatoeba-en-ja-ct2
+          retention-days: 1
+          if-no-files-found: error
