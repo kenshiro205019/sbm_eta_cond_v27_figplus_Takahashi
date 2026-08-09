@@ -1,7 +1,7 @@
 name: Temporary translation model download
 
 on:
-  push:
+  pull_request:
     branches:
       - main
 
