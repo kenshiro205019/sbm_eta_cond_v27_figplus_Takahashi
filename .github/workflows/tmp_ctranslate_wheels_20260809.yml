@@ -1,0 +1,31 @@
+name: Temporary CTranslate2 wheel download
+
+on:
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  fetch-wheels:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Download translation runtime wheels
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          mkdir -p wheels
+          python -m pip download --no-deps --dest wheels ctranslate2 sentencepiece argostranslate
+          python -m pip debug --verbose > wheels/pip_debug.txt
+          ls -lh wheels
+      - name: Upload wheels artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ctranslate2-py313-wheels
+          path: wheels
+          retention-days: 1
+          if-no-files-found: error
