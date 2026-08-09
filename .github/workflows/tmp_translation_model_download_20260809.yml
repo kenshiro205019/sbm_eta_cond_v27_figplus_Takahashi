@@ -1,0 +1,27 @@
+name: Temporary translation model download
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  fetch-model:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Argos English to Japanese package
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -L --fail --retry 5 --retry-delay 3 \
+            'https://pub-dbae765fb25a4114aac1c88b90e94178.r2.dev/v1/translate-en_ja-1_1.argosmodel' \
+            -o translate-en_ja-1_1.argosmodel
+          test -s translate-en_ja-1_1.argosmodel
+          ls -lh translate-en_ja-1_1.argosmodel
+      - name: Upload model artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: translate-en_ja-1_1-argosmodel
+          path: translate-en_ja-1_1.argosmodel
+          retention-days: 1
+          if-no-files-found: error
