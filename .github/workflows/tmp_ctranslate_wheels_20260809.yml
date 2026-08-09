@@ -1,4 +1,4 @@
-name: Temporary NLLB CTranslate2 model download
+name: Temporary split NLLB CTranslate2 model download
 
 on:
   pull_request:
@@ -9,23 +9,41 @@ jobs:
   fetch-model:
     runs-on: ubuntu-latest
     steps:
-      - name: Download NLLB-200 distilled 600M INT8 CTranslate2 files
+      - name: Download and split NLLB-200 distilled 600M INT8 model
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p nllb-model
+          mkdir -p nllb-model support model-part-a model-part-b
           base='https://huggingface.co/osa911/nllb-200-distilled-600M-ct2-int8/resolve/main'
-          for f in model.bin sentencepiece.bpe.model shared_vocabulary.json config.json; do
-            echo "Downloading $f"
-            curl -L --fail --retry 8 --retry-delay 5 "$base/$f?download=true" -o "nllb-model/$f"
-            test -s "nllb-model/$f"
+          curl -L --fail --retry 8 --retry-delay 5 "$base/model.bin?download=true" -o nllb-model/model.bin
+          for f in sentencepiece.bpe.model shared_vocabulary.json config.json; do
+            curl -L --fail --retry 8 --retry-delay 5 "$base/$f?download=true" -o "support/$f"
+            test -s "support/$f"
           done
-          sha256sum nllb-model/* > nllb-model/SHA256SUMS.txt
-          ls -lh nllb-model
-      - name: Upload NLLB model artifact
+          test -s nllb-model/model.bin
+          split -b 300M -d -a 2 nllb-model/model.bin model.bin.part-
+          mv model.bin.part-00 model-part-a/
+          mv model.bin.part-01 model-part-b/
+          sha256sum nllb-model/model.bin support/* > support/SHA256SUMS.txt
+          ls -lh model-part-a model-part-b support
+      - name: Upload model part A
         uses: actions/upload-artifact@v4
         with:
-          name: nllb-200-distilled-600M-ct2-int8
-          path: nllb-model
+          name: nllb-model-part-a
+          path: model-part-a
+          retention-days: 1
+          if-no-files-found: error
+      - name: Upload model part B
+        uses: actions/upload-artifact@v4
+        with:
+          name: nllb-model-part-b
+          path: model-part-b
+          retention-days: 1
+          if-no-files-found: error
+      - name: Upload model support files
+        uses: actions/upload-artifact@v4
+        with:
+          name: nllb-model-support
+          path: support
           retention-days: 1
           if-no-files-found: error
